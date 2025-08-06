@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import os
 from dotenv import load_dotenv
-from streamlit_lottie import st_lottie
+
 import json
 
 load_dotenv()
