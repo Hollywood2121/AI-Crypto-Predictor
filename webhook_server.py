@@ -1,36 +1,72 @@
 from fastapi import FastAPI, Request
-import stripe
-import os
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
+import os
+import smtplib
+import ssl
+import random
 
 load_dotenv()
+
 app = FastAPI()
 
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
-endpoint_secret = os.environ.get("STRIPE_ENDPOINT_SECRET")
+# Allow Streamlit frontend
+origins = [
+    os.getenv("FRONTEND_URL", "http://localhost:8501"),
+    "*"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Temporary in-memory store
+otp_store = {}
+
+class EmailRequest(BaseModel):
+    email: str
+
+class OTPVerifyRequest(BaseModel):
+    email: str
+    otp: str
+
+@app.post("/send-otp")
+def send_otp(data: EmailRequest):
+    email = data.email
+    otp = str(random.randint(100000, 999999))
+    otp_store[email] = otp
+
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+
+    message = f"""
+    Subject: Your OTP Code
+
+    Your login OTP is: {otp}
+    """
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, email, message)
+        return {"success": True, "message": "OTP sent"}
+    except Exception as e:
+        print("Email send error:", e)
+        return {"success": False, "message": str(e)}
+
+@app.post("/verify-otp")
+def verify_otp(data: OTPVerifyRequest):
+    if otp_store.get(data.email) == data.otp:
+        return {"authenticated": True, "pro": False}
+    return {"authenticated": False}
 
 @app.get("/")
-def read_root():
-    return {"message": "FastAPI server is live!"}
-
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, endpoint_secret
-        )
-    except ValueError as e:
-        return {"error": str(e)}
-    except stripe.error.SignatureVerificationError as e:
-        return {"error": str(e)}
-
-    # ✅ Handle checkout success
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        email = session["customer_details"]["email"]
-        # You can upgrade the user here (to be implemented)
-        print(f"Payment succeeded for {email}")
-
-    return {"status": "success"}
+def root():
+    return {"status": "Backend is running!"}
