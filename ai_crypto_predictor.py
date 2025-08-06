@@ -2,7 +2,6 @@ import streamlit as st
 import requests
 import os
 from dotenv import load_dotenv
-
 import json
 
 load_dotenv()
@@ -64,24 +63,32 @@ def login():
     with st.container():
         email = st.text_input("Enter your email")
         if st.button("📩 Send OTP"):
-            r = requests.post(f"{API_URL}/send-otp", json={"email": email})
-            if r.ok:
-                st.session_state.user_email = email
-                st.success("✅ OTP sent to your email inbox!")
-            else:
-                st.error("❌ Failed to send OTP. Check logs or SMTP setup.")
+            try:
+                r = requests.post(f"{API_URL}/send-otp", json={"email": email})
+                if r.ok:
+                    st.session_state.user_email = email
+                    st.success("✅ OTP sent to your email inbox!")
+                else:
+                    st.error("❌ Failed to send OTP. Please double-check your email or server setup.")
+            except Exception as e:
+                st.error("❌ Error while sending OTP.")
+                st.exception(e)
 
     if st.session_state.user_email:
         otp = st.text_input("Enter the OTP sent to your email")
         if st.button("🔓 Verify OTP"):
-            r = requests.post(f"{API_URL}/verify-otp", json={"email": st.session_state.user_email, "otp": otp})
-            if r.ok and r.json().get("authenticated"):
-                st.session_state.authenticated = True
-                st.session_state.pro = r.json().get("pro", False)
-                st.success("🎉 Logged in successfully!")
-                st.experimental_rerun()
-            else:
-                st.error("❌ Invalid OTP or expired")
+            try:
+                r = requests.post(f"{API_URL}/verify-otp", json={"email": st.session_state.user_email, "otp": otp})
+                if r.ok and r.json().get("authenticated"):
+                    st.session_state.authenticated = True
+                    st.session_state.pro = r.json().get("pro", False)
+                    st.success("🎉 Logged in successfully!")
+                    st.experimental_rerun()
+                else:
+                    st.error("❌ Invalid OTP or expired")
+            except Exception as e:
+                st.error("❌ Error while verifying OTP")
+                st.exception(e)
 
 # ----- Dashboard -----
 def dashboard():
