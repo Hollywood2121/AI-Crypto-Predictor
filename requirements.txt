@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+requests
+matplotlib
+scikit-learn
+tensorflow
+stripe
+fastapi
+uvicorn
+email-validator
+python-multipart
+python-dotenv
