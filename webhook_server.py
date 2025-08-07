@@ -36,7 +36,7 @@ class OTPVerifyRequest(BaseModel):
 
 @app.post("/send-otp")
 def send_otp(data: EmailRequest):
-    email = data.email
+    email = data.email.strip().lower()
     otp = str(random.randint(100000, 999999))
     otp_store[email] = otp
 
@@ -45,17 +45,18 @@ def send_otp(data: EmailRequest):
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASS")
 
-    message = f"""
-    Subject: Your OTP Code
+    if not all([smtp_server, smtp_port, smtp_user, smtp_pass]):
+        return {"success": False, "message": "SMTP configuration incomplete"}
 
-    Your login OTP is: {otp}
-    """
+    message = f"""Subject: Your OTP Code\n\nYour login OTP is: {otp}"""
+
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls(context=context)
             server.login(smtp_user, smtp_pass)
             server.sendmail(smtp_user, email, message)
+        print(f"✅ OTP sent to {email}")
         return {"success": True, "message": "OTP sent"}
     except Exception as e:
         print("Email send error:", e)
@@ -63,7 +64,8 @@ def send_otp(data: EmailRequest):
 
 @app.post("/verify-otp")
 def verify_otp(data: OTPVerifyRequest):
-    if otp_store.get(data.email) == data.otp:
+    email = data.email.strip().lower()
+    if otp_store.get(email) == data.otp:
         return {"authenticated": True, "pro": False}
     return {"authenticated": False}
 
