@@ -83,7 +83,8 @@ def login():
                     st.session_state.authenticated = True
                     st.session_state.pro = r.json().get("pro", False)
                     st.success("🎉 Logged in successfully!")
-                    st.experimental_rerun()
+                    st.rerun()
+
                 else:
                     st.error("❌ Invalid OTP or expired")
             except Exception as e:
