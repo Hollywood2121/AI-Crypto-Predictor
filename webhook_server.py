@@ -13,7 +13,7 @@ import os, smtplib, ssl, random, requests, time, math
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -40,7 +40,7 @@ DEFAULT_DB_URL = "sqlite:///./data/app.db"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 def _normalize_db_url(url: str) -> str:
-    # Render often returns postgres:// — fix to SQLAlchemy+psycopg v3 dialect
+    # Convert postgres:// → postgresql+psycopg:// for SQLAlchemy v2 + psycopg v3
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://") and not url.startswith("postgresql+psycopg://"):
@@ -54,7 +54,6 @@ if DATABASE_URL.startswith("sqlite"):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    # Postgres; psycopg v3 driver is selected by +psycopg in the URL
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 class User(SQLModel, table=True):
@@ -66,7 +65,7 @@ class Alert(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(foreign_key="user.email", index=True)
     symbol: str
-    direction: Literal["UP","DOWN"]
+    direction: str  # store as plain string in DB (UP/DOWN)
     percent: float
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
