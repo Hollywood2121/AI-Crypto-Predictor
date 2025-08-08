@@ -13,7 +13,7 @@ import os, smtplib, ssl, random, requests, time, math
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.5"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -21,16 +21,28 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+# --- CoinGecko setup (Pro vs Demo/Public) ---
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")  # optional
+COINGECKO_USE_PRO = os.getenv("COINGECKO_USE_PRO", "false").strip().lower() == "true"
 
+def cg_base(use_pro: bool) -> str:
+    return "https://pro-api.coingecko.com/api/v3" if use_pro else "https://api.coingecko.com/api/v3"
+
+def cg_headers(use_pro: bool) -> Dict[str, str]:
+    h = {"Accept": "application/json"}
+    if COINGECKO_API_KEY:
+        # Demo/public supports x-cg-demo-api-key, Pro supports x-cg-pro-api-key
+        h["x-cg-pro-api-key" if use_pro else "x-cg-demo-api-key"] = COINGECKO_API_KEY
+    return h
+
+# --- Coins (use valid CoinGecko IDs) ---
 COIN_IDS = [
     "bitcoin","ethereum","solana","cardano","ripple",
-    "binancecoin","dogecoin","avalanche-2","polygon","litecoin",
+    "binancecoin","dogecoin","avalanche-2","matic-network","litecoin",
 ]
 ID_TO_SYMBOL = {
     "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","cardano":"ADA","ripple":"XRP",
-    "binancecoin":"BNB","dogecoin":"DOGE","avalanche-2":"AVAX","polygon":"MATIC","litecoin":"LTC",
+    "binancecoin":"BNB","dogecoin":"DOGE","avalanche-2":"AVAX","matic-network":"MATIC","litecoin":"LTC",
 }
 SYMBOLS = list(ID_TO_SYMBOL.values())
 WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
@@ -65,7 +77,7 @@ class Alert(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(foreign_key="user.email", index=True)
     symbol: str
-    direction: str  # store as plain string in DB (UP/DOWN)
+    direction: str  # "UP" | "DOWN"
     percent: float
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -89,6 +101,7 @@ prices_cache: Dict[str, Any] = {"ts": 0.0, "data": [], "stale": True, "error": N
 last_prices: Dict[str, float] = {}
 last_triggered_at: Dict[str, float] = {}
 price_history: Dict[str, deque[Tuple[float, float]]] = {sym: deque(maxlen=1440) for sym in SYMBOLS}
+cg_next_allowed_at: float = 0.0  # rate limit backoff
 
 # ---------- Models (requests) ----------
 class EmailRequest(BaseModel):
@@ -131,26 +144,52 @@ def percent_move(old: float, new: float) -> float:
     if old <= 0: return 0.0
     return (new - old) / old * 100.0
 
-def _headers():
-    h = {"Accept": "application/json"}
-    if COINGECKO_API_KEY:
-        h["x-cg-pro-api-key"] = COINGECKO_API_KEY
-    return h
+def _simple_price_call(use_pro: bool) -> requests.Response:
+    ids = ",".join(COIN_IDS)
+    url = f"{cg_base(use_pro)}/simple/price"
+    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
+    headers = cg_headers(use_pro)
+    print(f"[CG] GET {url} ids={ids} use_pro={use_pro}")
+    r = requests.get(url, params=params, headers=headers, timeout=15)
+    if r.status_code >= 400:
+        # log body for troubleshooting
+        print(f"[CG] {r.status_code} body: {r.text[:500]}")
+    return r
 
 def _refresh_prices_once() -> bool:
-    ids = ",".join(COIN_IDS)
-    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
+    global cg_next_allowed_at
+    now = time.time()
+    if now < cg_next_allowed_at:
+        # still cooling down from a previous 429
+        return False
     try:
-        r = requests.get(COINGECKO_URL, params=params, headers=_headers(), timeout=15)
+        # Try per env flag first
+        r = _simple_price_call(COINGECKO_USE_PRO)
         if r.status_code == 429:
-            retry_after = r.headers.get("Retry-After")
-            msg = f"429 Too Many Requests. Retry-After={retry_after}"
-            prices_cache["error"], prices_cache["stale"] = msg, True
-            print(msg)
+            retry_after = int(r.headers.get("Retry-After", "60"))
+            cg_next_allowed_at = time.time() + max(30, retry_after)
+            print(f"429 Too Many Requests. Backing off for {retry_after}s")
             return False
-        r.raise_for_status()
-        raw = r.json()
+        if r.status_code in (400, 401, 403):
+            # Fallback to public API without key
+            print(f"[CG] {r.status_code} — attempting fallback to public API (no key)")
+            r2 = requests.get(
+                f"{cg_base(False)}/simple/price",
+                params={"ids": ",".join(COIN_IDS), "vs_currencies": "usd", "include_24hr_change": "true"},
+                timeout=15,
+            )
+            if r2.status_code == 429:
+                retry_after = int(r2.headers.get("Retry-After", "60"))
+                cg_next_allowed_at = time.time() + max(30, retry_after)
+                print(f"[CG fallback] 429. Backing off for {retry_after}s")
+                return False
+            r2.raise_for_status()
+            r = r2
+            print("✅ Fallback succeeded.")
+        else:
+            r.raise_for_status()
 
+        raw = r.json()
         data = []
         for cid, payload in raw.items():
             price = float(payload.get("usd", 0.0))
@@ -161,13 +200,14 @@ def _refresh_prices_once() -> bool:
             confidence = round(conf * 100, 1)
             data.append({"symbol": sym, "price": price, "change": change, "prediction": direction, "confidence": confidence})
 
-        now = time.time()
-        prices_cache.update({"ts": now, "data": data, "stale": False, "error": None})
+        ts = time.time()
+        prices_cache.update({"ts": ts, "data": data, "stale": False, "error": None})
         for c in data:
             sym, price = c["symbol"], float(c["price"])
-            price_history[sym].append((now, price))
+            price_history[sym].append((ts, price))
             last_prices[sym] = price
         return True
+
     except Exception as e:
         prices_cache["error"], prices_cache["stale"] = str(e), True
         print("refresh error:", e)
@@ -359,10 +399,10 @@ def on_start():
     global scheduler
     _refresh_prices_once()  # prime cache
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(scheduled_refresh, "interval", seconds=30, max_instances=1)
-    scheduler.add_job(check_alerts_and_notify, "interval", seconds=60, max_instances=1)
+    scheduler.add_job(scheduled_refresh, "interval", seconds=60, max_instances=1)  # 60s to reduce rate limits
+    scheduler.add_job(check_alerts_and_notify, "interval", seconds=90, max_instances=1)
     scheduler.start()
-    print("🚀 DB ready. Schedulers started (30s refresh, 60s alerts).")
+    print("🚀 DB ready. Schedulers started (60s refresh, 90s alerts).")
 
 @app.on_event("shutdown")
 def on_stop():
