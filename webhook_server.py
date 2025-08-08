@@ -105,6 +105,8 @@ def verify_otp(req: OTPVerifyRequest):
         return {"authenticated": True, "pro": False}
     return {"authenticated": False, "message": "Incorrect or expired OTP"}
 
+from datetime import datetime
+
 @app.get("/predict")
 def predict(email: str):
     """
@@ -119,4 +121,20 @@ def predict(email: str):
         {"symbol": "ADA", "price": 0.46, "change": 0.92},
         {"symbol": "XRP", "price": 0.57, "change": -1.21},
     ]
-    return {"email": email, "coins": coins}
+    return {
+        "email": email,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "coins": coins
+    }
+
+@app.get("/version")
+def version():
+    """
+    Returns the current backend version and build timestamp.
+    Useful for confirming deploys.
+    """
+    return {
+        "version": "1.0.0",
+        "build_time": datetime.utcnow().isoformat() + "Z",
+        "status": "Backend is running!"
+    }
