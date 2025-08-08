@@ -13,7 +13,7 @@ import os, smtplib, ssl, random, requests, time, math
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -35,14 +35,16 @@ ID_TO_SYMBOL = {
 SYMBOLS = list(ID_TO_SYMBOL.values())
 WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
 
-# ---------- Database ----------
+# ---------- Database (Postgres via psycopg v3) ----------
 DEFAULT_DB_URL = "sqlite:///./data/app.db"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 def _normalize_db_url(url: str) -> str:
-    # Render often gives postgres:// — normalize to postgresql:// for SQLAlchemy
+    # Render often returns postgres:// — fix to SQLAlchemy+psycopg v3 dialect
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+psycopg://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     return url
 
 DATABASE_URL = _normalize_db_url(DATABASE_URL)
@@ -52,7 +54,7 @@ if DATABASE_URL.startswith("sqlite"):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    # Postgres (Render URL already includes sslmode=require). psycopg2-binary installed.
+    # Postgres; psycopg v3 driver is selected by +psycopg in the URL
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 class User(SQLModel, table=True):
@@ -188,7 +190,6 @@ def get_window_change(sym: str, minutes: int, current_price: float) -> float:
 def scheduled_refresh():
     _refresh_prices_once()
 
-# ---------- DB helpers ----------
 def all_alerts(session: Session) -> List["Alert"]:
     return session.exec(select(Alert)).all()
 
@@ -197,7 +198,6 @@ def ensure_user(session: Session, email: str) -> None:
         session.add(User(email=email, is_pro=False))
         session.commit()
 
-# ---------- Alerts checking ----------
 def check_alerts_and_notify():
     try:
         if not prices_cache["data"]:
@@ -282,7 +282,7 @@ def predict(email: str, window: Literal["15m","1h","12h","24h"]="24h"):
         return {"error": str(e), "timestamp": utcnow_iso(), "window": window,
                 "stale": stale, "backend_ts": ts, "backend_error": err}
 
-# ----- Alerts (persisted in Postgres/SQLite) -----
+# ----- Alerts (persisted) -----
 @app.get("/alerts")
 def list_alerts(email: EmailStr):
     e = email.strip().lower()
