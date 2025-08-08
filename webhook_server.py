@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
@@ -12,7 +12,7 @@ import os, smtplib, ssl, random, requests, time, math
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -21,6 +21,8 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")  # optional
+
 COIN_IDS = [
     "bitcoin","ethereum","solana","cardano","ripple",
     "binancecoin","dogecoin","avalanche-2","polygon","litecoin",
@@ -37,7 +39,7 @@ WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "*"],  # tighten later
+    allow_origins=[FRONTEND_URL, "*"],
     allow_credentials=True,
     allow_methods=["GET","POST","DELETE","OPTIONS"],
     allow_headers=["*"],
@@ -46,12 +48,16 @@ app.add_middleware(
 # ---------- In‑memory stores ----------
 otp_store: Dict[str, str] = {}
 last_otp_sent_at: Dict[str, float] = {}
-prices_cache: Dict[str, Any] = {"ts": 0.0, "data": []}  # cached list of coin dicts
-last_prices: Dict[str, float] = {}  # symbol -> last price seen by scheduler
-alerts_by_email: Dict[str, List[Dict[str, Any]]] = {}  # email -> list of alert dicts
-last_triggered_at: Dict[str, float] = {}  # alert_key -> epoch seconds (cooldown)
-
-# per‑symbol minute snapshots for up to 24h: deque[(ts, price)]
+# prices_cache: holds last successful fetch and freshness state
+prices_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "data": [],          # list of coin dicts
+    "stale": True,       # true until first success
+    "error": None,       # last error string if any
+}
+last_prices: Dict[str, float] = {}
+alerts_by_email: Dict[str, List[Dict[str, Any]]] = {}
+last_triggered_at: Dict[str, float] = {}
 price_history: Dict[str, deque[Tuple[float, float]]] = {sym: deque(maxlen=1440) for sym in SYMBOLS}
 
 # ---------- Models ----------
@@ -66,7 +72,7 @@ class AlertCreate(BaseModel):
     email: EmailStr
     symbol: Literal["BTC","ETH","SOL","ADA","XRP","BNB","DOGE","AVAX","MATIC","LTC"]
     direction: Literal["UP","DOWN"]
-    percent: float  # e.g., 1.0, 2.0, 5.0, 10.0
+    percent: float
 
 # ---------- Helpers ----------
 def utcnow_iso() -> str:
@@ -91,91 +97,96 @@ def send_email(to_email: str, subject: str, body: str) -> Dict[str, Any]:
         print("Email send error:", e)
         return {"success": False, "message": str(e)}
 
-def rate_limited(email: str, window_sec: int = 60) -> bool:
-    now = time.time()
-    last = last_otp_sent_at.get(email, 0)
-    if now - last < window_sec:
-        return True
-    last_otp_sent_at[email] = now
-    return False
-
-def fetch_live_prices() -> List[Dict[str, Any]]:
-    """Fetch live prices + 24h change (USD) from CoinGecko, with 10s cache."""
-    now = time.time()
-    if now - prices_cache["ts"] < 10 and prices_cache["data"]:
-        return prices_cache["data"]
-
-    ids = ",".join(COIN_IDS)
-    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-    r = requests.get(COINGECKO_URL, params=params, timeout=15)
-    r.raise_for_status()
-    raw = r.json()
-
-    data = []
-    for cid, payload in raw.items():
-        price = float(payload.get("usd", 0.0))
-        change = float(payload.get("usd_24h_change", 0.0))
-        sym = ID_TO_SYMBOL.get(cid, cid.upper())
-
-        # dummy AI signal: confidence increases with absolute change
-        direction = "UP" if change >= 0 else "DOWN"
-        conf = 1 / (1 + math.exp(-abs(change) / 6))
-        confidence = round(conf * 100, 1)
-
-        data.append({
-            "symbol": sym,
-            "price": price,
-            "change": change,
-            "prediction": direction,
-            "confidence": confidence
-        })
-
-    prices_cache["ts"] = now
-    prices_cache["data"] = data
-    return data
-
 def percent_move(old: float, new: float) -> float:
     if old <= 0:
         return 0.0
     return (new - old) / old * 100.0
 
 def get_change_for_window(sym: str, minutes: int, current_price: float) -> float:
-    """Return % change between current and price ~minutes ago using price_history."""
     if minutes <= 0:
         return 0.0
     cutoff = time.time() - (minutes * 60)
     hist = price_history.get(sym, deque())
     base_price = None
-    # find the oldest sample newer than cutoff, else fall back to oldest available
     for ts, p in hist:
         if ts >= cutoff:
             base_price = p
             break
     if base_price is None:
-        # Not enough history; fall back to earliest record, or 0 change if empty
         if hist:
             base_price = hist[0][1]
         else:
             return 0.0
     return percent_move(base_price, current_price)
 
-def sample_prices_into_history():
-    """Called every minute: snapshot current prices into price_history and update last_prices."""
+def _coingecko_headers():
+    h = {"Accept": "application/json"}
+    if COINGECKO_API_KEY:
+        # CoinGecko Pro header
+        h["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    return h
+
+def _refresh_prices_once():
+    ids = ",".join(COIN_IDS)
+    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
     try:
-        coins = fetch_live_prices()
+        r = requests.get(COINGECKO_URL, params=params, headers=_coingecko_headers(), timeout=15)
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            msg = f"429 Too Many Requests. Retry-After={retry_after}"
+            prices_cache["error"] = msg
+            print(msg)
+            return False
+        r.raise_for_status()
+        raw = r.json()
+
+        data = []
+        for cid, payload in raw.items():
+            price = float(payload.get("usd", 0.0))
+            change = float(payload.get("usd_24h_change", 0.0))
+            sym = ID_TO_SYMBOL.get(cid, cid.upper())
+            direction = "UP" if change >= 0 else "DOWN"
+            conf = 1 / (1 + math.exp(-abs(change) / 6))
+            confidence = round(conf * 100, 1)
+            data.append({
+                "symbol": sym,
+                "price": price,
+                "change": change,
+                "prediction": direction,
+                "confidence": confidence
+            })
+
         now = time.time()
-        for c in coins:
-            sym = c["symbol"]
-            price = float(c["price"])
+        prices_cache["ts"] = now
+        prices_cache["data"] = data
+        prices_cache["stale"] = False
+        prices_cache["error"] = None
+
+        # push into history + last_prices
+        for c in data:
+            sym = c["symbol"]; price = float(c["price"])
             price_history[sym].append((now, price))
             last_prices[sym] = price
+
+        return True
+
     except Exception as e:
-        print("sample_prices_into_history error:", e)
+        prices_cache["error"] = str(e)
+        print("refresh error:", e)
+        return False
+
+def scheduled_refresh():
+    ok = _refresh_prices_once()
+    if not ok:
+        # keep stale data; do nothing
+        pass
 
 def check_alerts_and_notify():
-    """Runs every 60s: compare last minute to current minute and trigger threshold alerts."""
     try:
-        coins = fetch_live_prices()
+        # Use current cache; if empty, try a single fetch without hammering
+        if not prices_cache["data"]:
+            _refresh_prices_once()
+        coins = prices_cache["data"]
         sym_to_price = {c["symbol"]: float(c["price"]) for c in coins}
 
         for email, alerts in alerts_by_email.items():
@@ -185,7 +196,7 @@ def check_alerts_and_notify():
                     continue
                 price_now = sym_to_price[sym]
                 price_prev = last_prices.get(sym, price_now)
-                move = percent_move(price_prev, price_now)  # positive if up
+                move = percent_move(price_prev, price_now)
 
                 hit = (a["direction"] == "UP" and move >= a["percent"]) or \
                       (a["direction"] == "DOWN" and move <= -a["percent"])
@@ -193,8 +204,7 @@ def check_alerts_and_notify():
                 if hit:
                     key = f"{email}:{sym}:{a['direction']}:{a['percent']:.2f}"
                     last = last_triggered_at.get(key, 0.0)
-                    # cooldown: 30 minutes
-                    if time.time() - last >= 30*60:
+                    if time.time() - last >= 30*60:  # 30m cooldown
                         subject = f"[Alert] {sym} moved {move:+.2f}% ({a['direction']} {a['percent']}%)"
                         body = (
                             f"Symbol: {sym}\n"
@@ -206,11 +216,8 @@ def check_alerts_and_notify():
                         )
                         send_email(email, subject, body)
                         last_triggered_at[key] = time.time()
-
-        # update last prices AFTER processing
         for sym, p in sym_to_price.items():
             last_prices[sym] = p
-
     except Exception as e:
         print("check_alerts_and_notify error:", e)
 
@@ -219,15 +226,24 @@ def check_alerts_and_notify():
 def root():
     return {"status": "ok", "app": APP_NAME, "version": APP_VERSION}
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time": utcnow_iso()}
+@app.get("/version")
+def version():
+    return {
+        "version": APP_VERSION,
+        "build_time": utcnow_iso(),
+        "stale": prices_cache["stale"],
+        "last_ts": prices_cache["ts"],
+        "last_error": prices_cache["error"],
+        "status": "Backend is running!"
+    }
 
 @app.post("/send-otp")
 def send_otp(req: EmailRequest):
     email = req.email.strip().lower()
-    if rate_limited(email):
+    now = time.time()
+    if now - last_otp_sent_at.get(email, 0) < 60:
         return {"success": False, "message": "Please wait 60s before requesting another OTP."}
+    last_otp_sent_at[email] = now
     otp = f"{random.randint(100000, 999999)}"
     otp_store[email] = otp
     subject = "Your OTP Code"
@@ -252,14 +268,20 @@ def verify_otp(req: OTPVerifyRequest):
 @app.get("/predict")
 def predict(email: str, window: Literal["15m","1h","12h","24h"]="24h"):
     """
-    Live data + time-windowed change + dummy AI signal + timestamp.
-    window: 15m | 1h | 12h | 24h
+    Serve cached data; never hammer API here.
     """
     email = email.strip().lower()
+    # If cache empty (first boot), attempt a single fetch
+    if not prices_cache["data"]:
+        _refresh_prices_once()
+
+    coins = prices_cache["data"]
+    ts = prices_cache["ts"]
+    stale = prices_cache["stale"]
+    error = prices_cache["error"]
+
     try:
-        coins = fetch_live_prices()
         minutes = WINDOW_MINUTES.get(window, 1440)
-        # Recompute change per selected window using our history
         enriched = []
         for c in coins:
             sym = c["symbol"]
@@ -272,9 +294,24 @@ def predict(email: str, window: Literal["15m","1h","12h","24h"]="24h"):
                 "prediction": c["prediction"],
                 "confidence": c["confidence"]
             })
-        return {"email": email, "timestamp": utcnow_iso(), "window": window, "coins": enriched}
+        return {
+            "email": email,
+            "timestamp": utcnow_iso(),
+            "window": window,
+            "stale": stale,
+            "coins": enriched,
+            "backend_ts": ts,
+            "backend_error": error,
+        }
     except Exception as e:
-        return {"error": str(e), "timestamp": utcnow_iso(), "window": window}
+        return {
+            "error": str(e),
+            "timestamp": utcnow_iso(),
+            "window": window,
+            "stale": stale,
+            "backend_ts": ts,
+            "backend_error": error,
+        }
 
 # ----- Alerts API -----
 @app.get("/alerts")
@@ -290,7 +327,6 @@ def create_alert(alert: AlertCreate):
         alerts_by_email[email].append(entry)
     return {"success": True, "alerts": alerts_by_email[email]}
 
-# ---- GET fallback to add alerts if POST is blocked or old code is running
 @app.get("/alerts/add")
 def create_alert_get(
     email: EmailStr = Query(...),
@@ -320,10 +356,26 @@ scheduler: Optional[BackgroundScheduler] = None
 def on_start():
     global scheduler
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(sample_prices_into_history, "interval", seconds=60, max_instances=1)
+    # Refresh market data every 30 seconds (single source of truth)
+    scheduler.add_job(scheduled_refresh, "interval", seconds=30, max_instances=1)
+    # Sample prices to history every minute (for windowed deltas)
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    scheduler.add_job(lambda: None, "interval", seconds=30, max_instances=1)  # spacer
+    # keep the history sampler simple: just append latest cache price each minute
+    scheduler.add_job(_refresh_prices_once, "interval", seconds=60, max_instances=1)
     scheduler.add_job(check_alerts_and_notify, "interval", seconds=60, max_instances=1)
     scheduler.start()
-    print("📈 History sampler + 🔔 Alert scheduler started.")
+    print("📈 Refresh + 🔔 Alert scheduler started.")
 
 @app.on_event("shutdown")
 def on_stop():
@@ -331,7 +383,3 @@ def on_stop():
     if scheduler:
         scheduler.shutdown(wait=False)
         print("⏹️ Schedulers stopped.")
-
-@app.get("/version")
-def version():
-    return {"version": APP_VERSION, "build_time": utcnow_iso(), "status": "Backend is running!"}
