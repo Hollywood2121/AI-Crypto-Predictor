@@ -11,7 +11,7 @@ import os, smtplib, ssl, random, requests, time, math
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -35,7 +35,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_URL, "*"],  # tighten later
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET","POST","DELETE","OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -226,10 +226,24 @@ def create_alert(alert: AlertCreate):
     email = alert.email.strip().lower()
     entry = {"symbol": alert.symbol, "direction": alert.direction, "percent": float(alert.percent)}
     alerts_by_email.setdefault(email, [])
-    # prevent duplicates
     if entry not in alerts_by_email[email]:
         alerts_by_email[email].append(entry)
     return {"success": True, "alerts": alerts_by_email[email]}
+
+# ---- GET fallback to add alerts if POST is blocked or old code is running
+@app.get("/alerts/add")
+def create_alert_get(
+    email: EmailStr = Query(...),
+    symbol: Literal["BTC","ETH","SOL","ADA","XRP","BNB","DOGE","AVAX","MATIC","LTC"] = Query(...),
+    direction: Literal["UP","DOWN"] = Query(...),
+    percent: float = Query(...)
+):
+    e = email.strip().lower()
+    entry = {"symbol": symbol, "direction": direction, "percent": float(percent)}
+    alerts_by_email.setdefault(e, [])
+    if entry not in alerts_by_email[e]:
+        alerts_by_email[e].append(entry)
+    return {"success": True, "alerts": alerts_by_email[e]}
 
 @app.delete("/alerts")
 def delete_alert(email: EmailStr, symbol: str, direction: str, percent: float):
