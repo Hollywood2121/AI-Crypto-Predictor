@@ -3,39 +3,48 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-import os
-import smtplib
-import ssl
-import random
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+import os, smtplib, ssl, random, requests, time
 
 # ---------- Config ----------
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
-
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
+# CoinGecko (no key needed)
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+COIN_IDS = [
+    "bitcoin", "ethereum", "solana", "cardano", "ripple",
+    "binancecoin", "dogecoin", "avalanche-2", "polygon", "litecoin",
+]  # add/remove freely
+ID_TO_SYMBOL = {
+    "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "cardano": "ADA",
+    "ripple": "XRP", "binancecoin": "BNB", "dogecoin": "DOGE",
+    "avalanche-2": "AVAX", "polygon": "MATIC", "litecoin": "LTC",
+}
+
 # ---------- App ----------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-# CORS for Streamlit frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "*"],  # keep "*" while iterating; you can remove it later
+    allow_origins=[FRONTEND_URL, "*"],  # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- In-memory store (OK for demo; use Redis/DB in prod) ----------
+# ---------- In‑memory stores ----------
 otp_store: Dict[str, str] = {}
+last_otp_sent_at: Dict[str, float] = {}   # email -> epoch seconds
+prices_cache: Dict[str, Any] = {"ts": 0.0, "data": []}  # naive cache
 
 # ---------- Models ----------
 class EmailRequest(BaseModel):
@@ -52,7 +61,6 @@ def smtp_ready() -> bool:
 def send_email(to_email: str, subject: str, body: str) -> Dict[str, Any]:
     if not smtp_ready():
         return {"success": False, "message": "SMTP configuration incomplete"}
-
     msg = f"Subject: {subject}\n\n{body}"
     try:
         context = ssl.create_default_context()
@@ -66,6 +74,46 @@ def send_email(to_email: str, subject: str, body: str) -> Dict[str, Any]:
         print("Email send error:", e)
         return {"success": False, "message": str(e)}
 
+def rate_limited(email: str, window_sec: int = 60) -> bool:
+    """Limit OTP to once per minute per email."""
+    now = time.time()
+    last = last_otp_sent_at.get(email, 0)
+    if now - last < window_sec:
+        return True
+    last_otp_sent_at[email] = now
+    return False
+
+def fetch_live_prices() -> List[Dict[str, Any]]:
+    """Fetch live prices + 24h change (USD) from CoinGecko, with 10s cache."""
+    now = time.time()
+    if now - prices_cache["ts"] < 10 and prices_cache["data"]:
+        return prices_cache["data"]
+
+    ids = ",".join(COIN_IDS)
+    params = {
+        "ids": ids,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+    }
+    r = requests.get(COINGECKO_URL, params=params, timeout=15)
+    r.raise_for_status()
+    raw = r.json()
+
+    data = []
+    for cid, payload in raw.items():
+        price = float(payload.get("usd", 0.0))
+        change = float(payload.get("usd_24h_change", 0.0))
+        data.append({
+            "symbol": ID_TO_SYMBOL.get(cid, cid.upper()),
+            "price": price,
+            "change": change,
+        })
+
+    # cache
+    prices_cache["ts"] = now
+    prices_cache["data"] = data
+    return data
+
 # ---------- Routes ----------
 @app.get("/")
 def root():
@@ -73,22 +121,23 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
 
 @app.post("/send-otp")
 def send_otp(req: EmailRequest):
     email = req.email.strip().lower()
+    if rate_limited(email):
+        return {"success": False, "message": "Please wait 60s before requesting another OTP."}
+
     otp = f"{random.randint(100000, 999999)}"
     otp_store[email] = otp
 
     subject = "Your OTP Code"
     body = f"Your login OTP is: {otp}\n\nThis code expires in 10 minutes."
-
     result = send_email(email, subject, body)
     if result.get("success"):
         return {"success": True, "message": "OTP sent"}
     else:
-        # Bubble up the reason to the frontend for easier debugging
         return {"success": False, "message": result.get("message", "Send failed")}
 
 @app.post("/verify-otp")
@@ -100,41 +149,30 @@ def verify_otp(req: OTPVerifyRequest):
         return {"authenticated": False, "message": "Invalid OTP format"}
 
     if otp_store.get(email) == otp:
-        # Optional: remove it after use (one-time)
-        otp_store.pop(email, None)
+        otp_store.pop(email, None)  # one-time
         return {"authenticated": True, "pro": False}
     return {"authenticated": False, "message": "Incorrect or expired OTP"}
-
-from datetime import datetime
 
 @app.get("/predict")
 def predict(email: str):
     """
-    Simple mock data so the Streamlit UI can render something after login.
-    Replace later with your real model/data feed.
+    Live data from CoinGecko (USD price + 24h change) with a 10s cache.
     """
     email = email.strip().lower()
-    coins = [
-        {"symbol": "BTC", "price": 67231.12, "change": 1.24},
-        {"symbol": "ETH", "price": 3243.55, "change": -0.54},
-        {"symbol": "SOL", "price": 118.02, "change": 4.10},
-        {"symbol": "ADA", "price": 0.46, "change": 0.92},
-        {"symbol": "XRP", "price": 0.57, "change": -1.21},
-    ]
-    return {
-        "email": email,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "coins": coins
-    }
+    try:
+        coins = fetch_live_prices()
+        return {
+            "email": email,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "coins": coins
+        }
+    except Exception as e:
+        return {"error": str(e), "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 @app.get("/version")
 def version():
-    """
-    Returns the current backend version and build timestamp.
-    Useful for confirming deploys.
-    """
     return {
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "build_time": datetime.utcnow().isoformat() + "Z",
         "status": "Backend is running!"
     }
