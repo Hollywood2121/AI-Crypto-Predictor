@@ -2,16 +2,17 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-from datetime import datetime
-from typing import Dict, Any, List, Literal, Optional
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Literal, Optional, Tuple
 from apscheduler.schedulers.background import BackgroundScheduler
+from collections import deque
 import os, smtplib, ssl, random, requests, time, math
 
 # ---------- Config ----------
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -28,6 +29,9 @@ ID_TO_SYMBOL = {
     "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","cardano":"ADA","ripple":"XRP",
     "binancecoin":"BNB","dogecoin":"DOGE","avalanche-2":"AVAX","polygon":"MATIC","litecoin":"LTC",
 }
+SYMBOLS = list(ID_TO_SYMBOL.values())
+
+WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
 
 # ---------- App ----------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -47,6 +51,9 @@ last_prices: Dict[str, float] = {}  # symbol -> last price seen by scheduler
 alerts_by_email: Dict[str, List[Dict[str, Any]]] = {}  # email -> list of alert dicts
 last_triggered_at: Dict[str, float] = {}  # alert_key -> epoch seconds (cooldown)
 
+# per‑symbol minute snapshots for up to 24h: deque[(ts, price)]
+price_history: Dict[str, deque[Tuple[float, float]]] = {sym: deque(maxlen=1440) for sym in SYMBOLS}
+
 # ---------- Models ----------
 class EmailRequest(BaseModel):
     email: EmailStr
@@ -62,6 +69,9 @@ class AlertCreate(BaseModel):
     percent: float  # e.g., 1.0, 2.0, 5.0, 10.0
 
 # ---------- Helpers ----------
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def smtp_ready() -> bool:
     return all([SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS])
 
@@ -107,7 +117,7 @@ def fetch_live_prices() -> List[Dict[str, Any]]:
         change = float(payload.get("usd_24h_change", 0.0))
         sym = ID_TO_SYMBOL.get(cid, cid.upper())
 
-        # dummy AI signal
+        # dummy AI signal: confidence increases with absolute change
         direction = "UP" if change >= 0 else "DOWN"
         conf = 1 / (1 + math.exp(-abs(change) / 6))
         confidence = round(conf * 100, 1)
@@ -129,8 +139,41 @@ def percent_move(old: float, new: float) -> float:
         return 0.0
     return (new - old) / old * 100.0
 
+def get_change_for_window(sym: str, minutes: int, current_price: float) -> float:
+    """Return % change between current and price ~minutes ago using price_history."""
+    if minutes <= 0:
+        return 0.0
+    cutoff = time.time() - (minutes * 60)
+    hist = price_history.get(sym, deque())
+    base_price = None
+    # find the oldest sample newer than cutoff, else fall back to oldest available
+    for ts, p in hist:
+        if ts >= cutoff:
+            base_price = p
+            break
+    if base_price is None:
+        # Not enough history; fall back to earliest record, or 0 change if empty
+        if hist:
+            base_price = hist[0][1]
+        else:
+            return 0.0
+    return percent_move(base_price, current_price)
+
+def sample_prices_into_history():
+    """Called every minute: snapshot current prices into price_history and update last_prices."""
+    try:
+        coins = fetch_live_prices()
+        now = time.time()
+        for c in coins:
+            sym = c["symbol"]
+            price = float(c["price"])
+            price_history[sym].append((now, price))
+            last_prices[sym] = price
+    except Exception as e:
+        print("sample_prices_into_history error:", e)
+
 def check_alerts_and_notify():
-    """Runs every 60s: fetch prices, compare to last_prices, trigger alerts."""
+    """Runs every 60s: compare last minute to current minute and trigger threshold alerts."""
     try:
         coins = fetch_live_prices()
         sym_to_price = {c["symbol"]: float(c["price"]) for c in coins}
@@ -157,14 +200,14 @@ def check_alerts_and_notify():
                             f"Symbol: {sym}\n"
                             f"Direction: {a['direction']}\n"
                             f"Threshold: {a['percent']}%\n"
-                            f"Move since last check: {move:+.2f}%\n"
+                            f"Move since last minute: {move:+.2f}%\n"
                             f"Current price: ${price_now:,.2f}\n\n"
-                            f"Time (UTC): {datetime.utcnow().isoformat()}Z"
+                            f"Time (UTC): {utcnow_iso()}"
                         )
                         send_email(email, subject, body)
                         last_triggered_at[key] = time.time()
 
-        # update last prices AFTER processing, so moves are from previous cycle
+        # update last prices AFTER processing
         for sym, p in sym_to_price.items():
             last_prices[sym] = p
 
@@ -178,7 +221,7 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+    return {"ok": True, "time": utcnow_iso()}
 
 @app.post("/send-otp")
 def send_otp(req: EmailRequest):
@@ -207,14 +250,31 @@ def verify_otp(req: OTPVerifyRequest):
     return {"authenticated": False, "message": "Incorrect or expired OTP"}
 
 @app.get("/predict")
-def predict(email: str):
-    """Live data + dummy AI signal + timestamp."""
+def predict(email: str, window: Literal["15m","1h","12h","24h"]="24h"):
+    """
+    Live data + time-windowed change + dummy AI signal + timestamp.
+    window: 15m | 1h | 12h | 24h
+    """
     email = email.strip().lower()
     try:
         coins = fetch_live_prices()
-        return {"email": email, "timestamp": datetime.utcnow().isoformat() + "Z", "coins": coins}
+        minutes = WINDOW_MINUTES.get(window, 1440)
+        # Recompute change per selected window using our history
+        enriched = []
+        for c in coins:
+            sym = c["symbol"]
+            price = float(c["price"])
+            win_change = get_change_for_window(sym, minutes, price)
+            enriched.append({
+                "symbol": sym,
+                "price": price,
+                "change": win_change,
+                "prediction": c["prediction"],
+                "confidence": c["confidence"]
+            })
+        return {"email": email, "timestamp": utcnow_iso(), "window": window, "coins": enriched}
     except Exception as e:
-        return {"error": str(e), "timestamp": datetime.utcnow().isoformat() + "Z"}
+        return {"error": str(e), "timestamp": utcnow_iso(), "window": window}
 
 # ----- Alerts API -----
 @app.get("/alerts")
@@ -260,17 +320,18 @@ scheduler: Optional[BackgroundScheduler] = None
 def on_start():
     global scheduler
     scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(sample_prices_into_history, "interval", seconds=60, max_instances=1)
     scheduler.add_job(check_alerts_and_notify, "interval", seconds=60, max_instances=1)
     scheduler.start()
-    print("🔔 Alert scheduler started.")
+    print("📈 History sampler + 🔔 Alert scheduler started.")
 
 @app.on_event("shutdown")
 def on_stop():
     global scheduler
     if scheduler:
         scheduler.shutdown(wait=False)
-        print("🔔 Alert scheduler stopped.")
+        print("⏹️ Schedulers stopped.")
 
 @app.get("/version")
 def version():
-    return {"version": APP_VERSION, "build_time": datetime.utcnow().isoformat() + "Z", "status": "Backend is running!"}
+    return {"version": APP_VERSION, "build_time": utcnow_iso(), "status": "Backend is running!"}
