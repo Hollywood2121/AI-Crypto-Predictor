@@ -6,13 +6,14 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Literal, Optional, Tuple
 from apscheduler.schedulers.background import BackgroundScheduler
 from collections import deque
+from sqlmodel import SQLModel, Field, Session, create_engine, select
 import os, smtplib, ssl, random, requests, time, math
 
 # ---------- Config ----------
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -34,6 +35,33 @@ ID_TO_SYMBOL = {
 SYMBOLS = list(ID_TO_SYMBOL.values())
 WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
 
+# ---------- Database (SQLite by default; set DATABASE_URL to use Postgres later) ----------
+DEFAULT_DB_URL = "sqlite:///./data/app.db"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+
+if DATABASE_URL.startswith("sqlite"):
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+class User(SQLModel, table=True):
+    email: str = Field(primary_key=True)
+    is_pro: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Alert(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(foreign_key="user.email", index=True)
+    symbol: str
+    direction: Literal["UP","DOWN"]
+    percent: float
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+def get_session() -> Session:
+    return Session(engine)
+
 # ---------- App ----------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.add_middleware(
@@ -44,16 +72,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- In‑memory stores ----------
+# ---------- In-memory runtime state (OK to be ephemeral) ----------
 otp_store: Dict[str, str] = {}
 last_otp_sent_at: Dict[str, float] = {}
 prices_cache: Dict[str, Any] = {"ts": 0.0, "data": [], "stale": True, "error": None}
 last_prices: Dict[str, float] = {}
-alerts_by_email: Dict[str, List[Dict[str, Any]]] = {}
-last_triggered_at: Dict[str, float] = {}
+last_triggered_at: Dict[str, float] = {}  # cooldown memory
 price_history: Dict[str, deque[Tuple[float, float]]] = {sym: deque(maxlen=1440) for sym in SYMBOLS}
 
-# ---------- Models ----------
+# ---------- Models (requests) ----------
 class EmailRequest(BaseModel):
     email: EmailStr
 
@@ -152,39 +179,49 @@ def get_window_change(sym: str, minutes: int, current_price: float) -> float:
 def scheduled_refresh():
     _refresh_prices_once()
 
+def all_alerts(session: Session) -> List[Alert]:
+    return session.exec(select(Alert)).all()
+
 def check_alerts_and_notify():
     try:
-        coins = prices_cache["data"]
-        if not coins:
+        # Ensure we have some data
+        if not prices_cache["data"]:
             _refresh_prices_once()
-            coins = prices_cache["data"]
+        coins = prices_cache["data"]
         sym_to_price = {c["symbol"]: float(c["price"]) for c in coins}
 
-        for email, alerts in alerts_by_email.items():
-            for a in alerts:
-                sym = a["symbol"]
-                if sym not in sym_to_price: continue
+        with get_session() as session:
+            records = all_alerts(session)
+            for a in records:
+                sym = a.symbol
+                if sym not in sym_to_price:
+                    continue
                 now_p = sym_to_price[sym]
                 prev_p = last_prices.get(sym, now_p)
                 mv = percent_move(prev_p, now_p)
-                hit = (a["direction"] == "UP" and mv >= a["percent"]) or (a["direction"] == "DOWN" and mv <= -a["percent"])
+
+                hit = (a.direction == "UP" and mv >= a.percent) or (a.direction == "DOWN" and mv <= -a.percent)
                 if hit:
-                    key = f"{email}:{sym}:{a['direction']}:{a['percent']:.2f}"
+                    key = f"{a.email}:{sym}:{a.direction}:{a.percent:.2f}"
                     last = last_triggered_at.get(key, 0.0)
-                    if time.time() - last >= 30*60:
-                        subject = f"[Alert] {sym} moved {mv:+.2f}% ({a['direction']} {a['percent']}%)"
-                        body = (f"Symbol: {sym}\nDirection: {a['direction']}\nThreshold: {a['percent']}%\n"
+                    if time.time() - last >= 30*60:  # 30m cooldown
+                        subject = f"[Alert] {sym} moved {mv:+.2f}% ({a.direction} {a.percent}%)"
+                        body = (f"Symbol: {sym}\nDirection: {a.direction}\nThreshold: {a.percent}%\n"
                                 f"Move since last minute: {mv:+.2f}%\nCurrent price: ${now_p:,.2f}\n\nTime (UTC): {utcnow_iso()}")
-                        send_email(email, subject, body)
+                        send_email(a.email, subject, body)
                         last_triggered_at[key] = time.time()
+
+        # Update last prices after processing
         for sym, p in sym_to_price.items():
             last_prices[sym] = p
+
     except Exception as e:
         print("check_alerts_and_notify error:", e)
 
 # ---------- Routes ----------
 @app.get("/")
-def root(): return {"status": "ok", "app": APP_NAME, "version": APP_VERSION}
+def root(): 
+    return {"status": "ok", "app": APP_NAME, "version": APP_VERSION}
 
 @app.get("/version")
 def version():
@@ -210,6 +247,12 @@ def verify_otp(req: OTPVerifyRequest):
         return {"authenticated": False, "message": "Invalid OTP format"}
     if otp_store.get(email) == otp:
         otp_store.pop(email, None)
+        # ensure user exists
+        with get_session() as session:
+            existing = session.get(User, email)
+            if not existing:
+                session.add(User(email=email, is_pro=False))
+                session.commit()
         return {"authenticated": True, "pro": False}
     return {"authenticated": False, "message": "Incorrect or expired OTP"}
 
@@ -233,18 +276,38 @@ def predict(email: str, window: Literal["15m","1h","12h","24h"]="24h"):
         return {"error": str(e), "timestamp": utcnow_iso(), "window": window,
                 "stale": stale, "backend_ts": ts, "backend_error": err}
 
+# ----- Alerts (now persisted) -----
 @app.get("/alerts")
 def list_alerts(email: EmailStr):
-    return {"email": email, "alerts": alerts_by_email.get(email.lower(), [])}
+    e = email.strip().lower()
+    with get_session() as session:
+        rows = session.exec(select(Alert).where(Alert.email == e)).all()
+        return {"email": e, "alerts": [{"symbol": r.symbol, "direction": r.direction, "percent": r.percent} for r in rows]}
 
 @app.post("/alerts")
 def create_alert(alert: AlertCreate):
-    email = alert.email.strip().lower()
-    entry = {"symbol": alert.symbol, "direction": alert.direction, "percent": float(alert.percent)}
-    alerts_by_email.setdefault(email, [])
-    if entry not in alerts_by_email[email]:
-        alerts_by_email[email].append(entry)
-    return {"success": True, "alerts": alerts_by_email[email]}
+    e = alert.email.strip().lower()
+    with get_session() as session:
+        # ensure user exists
+        user = session.get(User, e)
+        if not user:
+            user = User(email=e, is_pro=False)
+            session.add(user)
+            session.commit()
+        # avoid duplicates
+        existing = session.exec(
+            select(Alert).where(
+                (Alert.email == e) &
+                (Alert.symbol == alert.symbol) &
+                (Alert.direction == alert.direction) &
+                (Alert.percent == float(alert.percent))
+            )
+        ).first()
+        if not existing:
+            session.add(Alert(email=e, symbol=alert.symbol, direction=alert.direction, percent=float(alert.percent)))
+            session.commit()
+        rows = session.exec(select(Alert).where(Alert.email == e)).all()
+        return {"success": True, "alerts": [{"symbol": r.symbol, "direction": r.direction, "percent": r.percent} for r in rows]}
 
 @app.get("/alerts/add")
 def create_alert_get(
@@ -254,34 +317,55 @@ def create_alert_get(
     percent: float = Query(...)
 ):
     e = email.strip().lower()
-    entry = {"symbol": symbol, "direction": direction, "percent": float(percent)}
-    alerts_by_email.setdefault(e, [])
-    if entry not in alerts_by_email[e]:
-        alerts_by_email[e].append(entry)
-    return {"success": True, "alerts": alerts_by_email[e]}
+    with get_session() as session:
+        if not session.get(User, e):
+            session.add(User(email=e, is_pro=False))
+            session.commit()
+        existing = session.exec(
+            select(Alert).where(
+                (Alert.email == e) &
+                (Alert.symbol == symbol) &
+                (Alert.direction == direction) &
+                (Alert.percent == float(percent))
+            )
+        ).first()
+        if not existing:
+            session.add(Alert(email=e, symbol=symbol, direction=direction, percent=float(percent)))
+            session.commit()
+        rows = session.exec(select(Alert).where(Alert.email == e)).all()
+        return {"success": True, "alerts": [{"symbol": r.symbol, "direction": r.direction, "percent": r.percent} for r in rows]}
 
 @app.delete("/alerts")
 def delete_alert(email: EmailStr, symbol: str, direction: str, percent: float):
-    email = email.strip().lower()
-    items = alerts_by_email.get(email, [])
-    new_items = [a for a in items if not (a["symbol"] == symbol and a["direction"] == direction and float(a["percent"]) == float(percent))]
-    alerts_by_email[email] = new_items
-    return {"success": True, "alerts": new_items}
+    e = email.strip().lower()
+    with get_session() as session:
+        rows = session.exec(
+            select(Alert).where(
+                (Alert.email == e) &
+                (Alert.symbol == symbol) &
+                (Alert.direction == direction) &
+                (Alert.percent == float(percent))
+            )
+        ).all()
+        for r in rows:
+            session.delete(r)
+        session.commit()
+        rows = session.exec(select(Alert).where(Alert.email == e)).all()
+        return {"success": True, "alerts": [{"symbol": r.symbol, "direction": r.direction, "percent": r.percent} for r in rows]}
 
-# ---------- Scheduler ----------
+# ---------- Lifecycle ----------
 scheduler: Optional[BackgroundScheduler] = None
 
 @app.on_event("startup")
 def on_start():
+    SQLModel.metadata.create_all(engine)  # create tables if missing
     global scheduler
-    # 1) Prime the cache immediately so /predict has data
-    _refresh_prices_once()
-    # 2) Start schedulers
+    _refresh_prices_once()  # prime cache
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(scheduled_refresh, "interval", seconds=30, max_instances=1)
     scheduler.add_job(check_alerts_and_notify, "interval", seconds=60, max_instances=1)
     scheduler.start()
-    print("🚀 Schedulers started (30s refresh, 60s alerts).")
+    print("🚀 DB ready. Schedulers started (30s refresh, 60s alerts).")
 
 @app.on_event("shutdown")
 def on_stop():
