@@ -3,15 +3,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List
 import os, smtplib, ssl, random, requests, time
+import math
 
 # ---------- Config ----------
 load_dotenv()
 
 APP_NAME = "AI Crypto Backend"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -19,16 +20,14 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 
-# CoinGecko (no key needed)
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 COIN_IDS = [
-    "bitcoin", "ethereum", "solana", "cardano", "ripple",
-    "binancecoin", "dogecoin", "avalanche-2", "polygon", "litecoin",
-]  # add/remove freely
+    "bitcoin","ethereum","solana","cardano","ripple",
+    "binancecoin","dogecoin","avalanche-2","polygon","litecoin",
+]
 ID_TO_SYMBOL = {
-    "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "cardano": "ADA",
-    "ripple": "XRP", "binancecoin": "BNB", "dogecoin": "DOGE",
-    "avalanche-2": "AVAX", "polygon": "MATIC", "litecoin": "LTC",
+    "bitcoin":"BTC","ethereum":"ETH","solana":"SOL","cardano":"ADA","ripple":"XRP",
+    "binancecoin":"BNB","dogecoin":"DOGE","avalanche-2":"AVAX","polygon":"MATIC","litecoin":"LTC",
 }
 
 # ---------- App ----------
@@ -43,8 +42,8 @@ app.add_middleware(
 
 # ---------- In‑memory stores ----------
 otp_store: Dict[str, str] = {}
-last_otp_sent_at: Dict[str, float] = {}   # email -> epoch seconds
-prices_cache: Dict[str, Any] = {"ts": 0.0, "data": []}  # naive cache
+last_otp_sent_at: Dict[str, float] = {}
+prices_cache: Dict[str, Any] = {"ts": 0.0, "data": []}
 
 # ---------- Models ----------
 class EmailRequest(BaseModel):
@@ -75,7 +74,6 @@ def send_email(to_email: str, subject: str, body: str) -> Dict[str, Any]:
         return {"success": False, "message": str(e)}
 
 def rate_limited(email: str, window_sec: int = 60) -> bool:
-    """Limit OTP to once per minute per email."""
     now = time.time()
     last = last_otp_sent_at.get(email, 0)
     if now - last < window_sec:
@@ -90,11 +88,7 @@ def fetch_live_prices() -> List[Dict[str, Any]]:
         return prices_cache["data"]
 
     ids = ",".join(COIN_IDS)
-    params = {
-        "ids": ids,
-        "vs_currencies": "usd",
-        "include_24hr_change": "true",
-    }
+    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
     r = requests.get(COINGECKO_URL, params=params, timeout=15)
     r.raise_for_status()
     raw = r.json()
@@ -103,13 +97,23 @@ def fetch_live_prices() -> List[Dict[str, Any]]:
     for cid, payload in raw.items():
         price = float(payload.get("usd", 0.0))
         change = float(payload.get("usd_24h_change", 0.0))
+        sym = ID_TO_SYMBOL.get(cid, cid.upper())
+
+        # --- Dummy AI prediction ---
+        # Direction: if 24h momentum is positive -> UP (else DOWN)
+        direction = "UP" if change >= 0 else "DOWN"
+        # Confidence: logistic map from |change| (caps around ~95)
+        conf = 1 / (1 + math.exp(-abs(change) / 6))  # tweak divisor for calibration
+        confidence = round(conf * 100, 1)
+
         data.append({
-            "symbol": ID_TO_SYMBOL.get(cid, cid.upper()),
+            "symbol": sym,
             "price": price,
             "change": change,
+            "prediction": direction,
+            "confidence": confidence
         })
 
-    # cache
     prices_cache["ts"] = now
     prices_cache["data"] = data
     return data
@@ -144,20 +148,16 @@ def send_otp(req: EmailRequest):
 def verify_otp(req: OTPVerifyRequest):
     email = req.email.strip().lower()
     otp = req.otp.strip()
-
     if not otp or len(otp) != 6 or not otp.isdigit():
         return {"authenticated": False, "message": "Invalid OTP format"}
-
     if otp_store.get(email) == otp:
-        otp_store.pop(email, None)  # one-time
+        otp_store.pop(email, None)
         return {"authenticated": True, "pro": False}
     return {"authenticated": False, "message": "Incorrect or expired OTP"}
 
 @app.get("/predict")
 def predict(email: str):
-    """
-    Live data from CoinGecko (USD price + 24h change) with a 10s cache.
-    """
+    """Live data (USD price + 24h change) plus dummy AI signal."""
     email = email.strip().lower()
     try:
         coins = fetch_live_prices()
