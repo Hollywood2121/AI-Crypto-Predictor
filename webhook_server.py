@@ -12,7 +12,8 @@ import os, smtplib, ssl, random, requests, time, math
 # ---------- Config ----------
 load_dotenv()
 
-APP_NAME = "AI Crypto Backend"
+BRAND_NAME = os.getenv("BRAND_NAME", "Cryptonyk")
+APP_NAME = f"{BRAND_NAME} Backend"
 APP_VERSION = "1.5.5"
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
@@ -31,7 +32,6 @@ def cg_base(use_pro: bool) -> str:
 def cg_headers(use_pro: bool) -> Dict[str, str]:
     h = {"Accept": "application/json"}
     if COINGECKO_API_KEY:
-        # Demo/public supports x-cg-demo-api-key, Pro supports x-cg-pro-api-key
         h["x-cg-pro-api-key" if use_pro else "x-cg-demo-api-key"] = COINGECKO_API_KEY
     return h
 
@@ -47,12 +47,11 @@ ID_TO_SYMBOL = {
 SYMBOLS = list(ID_TO_SYMBOL.values())
 WINDOW_MINUTES = {"15m": 15, "1h": 60, "12h": 720, "24h": 1440}
 
-# ---------- Database (Postgres via psycopg v3) ----------
+# ---------- Database ----------
 DEFAULT_DB_URL = "sqlite:///./data/app.db"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 def _normalize_db_url(url: str) -> str:
-    # Convert postgres:// → postgresql+psycopg:// for SQLAlchemy v2 + psycopg v3
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://") and not url.startswith("postgresql+psycopg://"):
@@ -88,7 +87,7 @@ def get_session() -> Session:
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "https://ai-crypto-frontend-8rmwtc8eqtxsasgmhbv8d6.streamlit.app", "*"],
+    allow_origins=[FRONTEND_URL, "https://ai-crypto-frontend-8rmwtc8eqtxsasgmhbv8d6.streamlit.app", "https://cryptonyk.com", "*"],
     allow_credentials=True,
     allow_methods=["GET","POST","DELETE","OPTIONS"],
     allow_headers=["*"],
@@ -103,7 +102,7 @@ last_triggered_at: Dict[str, float] = {}
 price_history: Dict[str, deque[Tuple[float, float]]] = {sym: deque(maxlen=1440) for sym in SYMBOLS}
 cg_next_allowed_at: float = 0.0  # rate limit backoff
 
-# ---------- Models (requests) ----------
+# ---------- Models ----------
 class EmailRequest(BaseModel):
     email: EmailStr
 
@@ -127,7 +126,8 @@ def smtp_ready() -> bool:
 def send_email(to_email: str, subject: str, body: str) -> Dict[str, Any]:
     if not smtp_ready():
         return {"success": False, "message": "SMTP configuration incomplete"}
-    msg = f"Subject: {subject}\n\n{body}"
+    # Include From/To headers to look better in inbox
+    msg = f"Subject: {subject}\nFrom: {BRAND_NAME} <{SMTP_USER}>\nTo: {to_email}\n\n{body}"
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
@@ -152,7 +152,6 @@ def _simple_price_call(use_pro: bool) -> requests.Response:
     print(f"[CG] GET {url} ids={ids} use_pro={use_pro}")
     r = requests.get(url, params=params, headers=headers, timeout=15)
     if r.status_code >= 400:
-        # log body for troubleshooting
         print(f"[CG] {r.status_code} body: {r.text[:500]}")
     return r
 
@@ -160,10 +159,8 @@ def _refresh_prices_once() -> bool:
     global cg_next_allowed_at
     now = time.time()
     if now < cg_next_allowed_at:
-        # still cooling down from a previous 429
         return False
     try:
-        # Try per env flag first
         r = _simple_price_call(COINGECKO_USE_PRO)
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", "60"))
@@ -171,7 +168,6 @@ def _refresh_prices_once() -> bool:
             print(f"429 Too Many Requests. Backing off for {retry_after}s")
             return False
         if r.status_code in (400, 401, 403):
-            # Fallback to public API without key
             print(f"[CG] {r.status_code} — attempting fallback to public API (no key)")
             r2 = requests.get(
                 f"{cg_base(False)}/simple/price",
@@ -257,7 +253,7 @@ def check_alerts_and_notify():
                     key = f"{a.email}:{sym}:{a.direction}:{a.percent:.2f}"
                     last = last_triggered_at.get(key, 0.0)
                     if time.time() - last >= 30*60:
-                        subject = f"[Alert] {sym} moved {mv:+.2f}% ({a.direction} {a.percent}%)"
+                        subject = f"[{BRAND_NAME} Alert] {sym} moved {mv:+.2f}% ({a.direction} {a.percent}%)"
                         body = (f"Symbol: {sym}\nDirection: {a.direction}\nThreshold: {a.percent}%\n"
                                 f"Move since last minute: {mv:+.2f}%\nCurrent price: ${now_p:,.2f}\n\nTime (UTC): {utcnow_iso()}")
                         send_email(a.email, subject, body)
@@ -274,8 +270,9 @@ def root():
 
 @app.get("/version")
 def version():
-    return {"version": APP_VERSION, "build_time": utcnow_iso(), "stale": prices_cache["stale"],
-            "last_ts": prices_cache["ts"], "last_error": prices_cache["error"], "status": "Backend is running!"}
+    return {"version": APP_VERSION, "brand": BRAND_NAME, "build_time": utcnow_iso(),
+            "stale": prices_cache["stale"], "last_ts": prices_cache["ts"], "last_error": prices_cache["error"],
+            "status": "Backend is running!"}
 
 @app.post("/send-otp")
 def send_otp(req: EmailRequest):
@@ -286,7 +283,7 @@ def send_otp(req: EmailRequest):
     last_otp_sent_at[email] = now
     otp = f"{random.randint(100000, 999999)}"
     otp_store[email] = otp
-    result = send_email(email, "Your OTP Code", f"Your login OTP is: {otp}\n\nThis code expires in 10 minutes.")
+    result = send_email(email, f"Your {BRAND_NAME} OTP Code", f"Your login OTP is: {otp}\n\nThis code expires in 10 minutes.")
     return {"success": True, "message": "OTP sent"} if result.get("success") else {"success": False, "message": result.get("message", "Send failed")}
 
 @app.post("/verify-otp")
@@ -399,7 +396,7 @@ def on_start():
     global scheduler
     _refresh_prices_once()  # prime cache
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(scheduled_refresh, "interval", seconds=60, max_instances=1)  # 60s to reduce rate limits
+    scheduler.add_job(scheduled_refresh, "interval", seconds=60, max_instances=1)
     scheduler.add_job(check_alerts_and_notify, "interval", seconds=90, max_instances=1)
     scheduler.start()
     print("🚀 DB ready. Schedulers started (60s refresh, 90s alerts).")
